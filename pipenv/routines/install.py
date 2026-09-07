@@ -129,14 +129,17 @@ def _should_use_no_binary(pkg_name, extra_pip_args):
     return False
 
 
-def _config_settings_pip_args(config_settings, extra_pip_args):
-    """Return normalized pip arguments for package build settings.
+def _split_config_settings_pip_args(config_settings, extra_pip_args):
+    """Separate package build settings from generic pip arguments.
 
     ``--config-settings`` is a per-package build option. Keep it separate
     from the generic passthrough arguments so it can be recorded in the
-    package's Pipfile entry and replayed on later installs.
+    package's Pipfile entry and replayed on later installs. Returning the
+    remaining arguments prevents legacy ``--extra-pip-args`` forms from
+    leaking the setting into every package in a later install phase.
     """
     pip_args = []
+    passthrough_args = []
     for setting in config_settings or ():
         pip_args.extend(("--config-settings", setting))
 
@@ -151,23 +154,35 @@ def _config_settings_pip_args(config_settings, extra_pip_args):
             pip_args.extend(("--config-settings", arg.split("=", 1)[1]))
             index += 1
         else:
+            passthrough_args.append(arg)
             index += 1
+    return pip_args, passthrough_args
+
+
+def _config_settings_pip_args(config_settings, extra_pip_args):
+    """Return normalized pip arguments for package build settings."""
+    pip_args, _ = _split_config_settings_pip_args(config_settings, extra_pip_args)
     return pip_args
 
 
 def _pip_args_for_dependency(dependency, lockfile_section, pip_line=None):
     """Read reproducible, package-scoped pip arguments from a lock entry."""
+    from pipenv.utils.dependencies import requirement_from_lockfile
+
     dependency_name = getattr(dependency, "name", None)
 
     def normalize(name):
         return str(name).lower().replace("-", "_").replace(".", "_")
 
+    normalized_dependency_name = (
+        normalize(dependency_name) if dependency_name else None
+    )
     for package_name, entry in lockfile_section.items():
-        matches_name = dependency_name and normalize(package_name) == normalize(dependency_name)
+        matches_name = normalized_dependency_name and (
+            normalize(package_name) == normalized_dependency_name
+        )
         matches_requirement = False
         if not matches_name and pip_line and isinstance(entry, dict):
-            from pipenv.utils.dependencies import requirement_from_lockfile
-
             generated_line = requirement_from_lockfile(
                 package_name,
                 entry,
@@ -215,7 +230,7 @@ def handle_new_packages(
     editable_packages = list(sel.editable_packages) if sel.editable_packages else []
     pipfile_categories = list(sel.categories) if sel.categories else []
     extra_pip_args = list(exec_opts.extra_pip_args) if exec_opts.extra_pip_args else []
-    package_pip_args = _config_settings_pip_args(
+    package_pip_args, extra_pip_args = _split_config_settings_pip_args(
         getattr(exec_opts, "config_settings", ()), extra_pip_args
     )
     index = sel.index
@@ -921,8 +936,8 @@ def batch_install(
         for pkg_name, entry in lockfile_section.items()
         if isinstance(entry, dict) and entry.get("no_binary")
     ]
-    extra_pip_args = (
-        list(exec_opts.extra_pip_args) if exec_opts.extra_pip_args else []
+    _, extra_pip_args = _split_config_settings_pip_args(
+        getattr(exec_opts, "config_settings", ()), exec_opts.extra_pip_args
     )
     if no_binary_packages:
         extra_pip_args = list(extra_pip_args)
@@ -1030,8 +1045,13 @@ def batch_install(
                         requirements_dir,
                     )
             except StopIteration:  # noqa: PERF203
+                missing_dependencies = [
+                    dependency
+                    for dependencies in dependencies_by_args.values()
+                    for dependency in dependencies
+                ]
                 console.print(
-                    f"Unable to find {index_name} in sources, please check dependencies: {dependencies}",
+                    f"Unable to find {index_name} in sources, please check dependencies: {missing_dependencies}",
                     style="bold red",
                 )
                 sys.exit(1)

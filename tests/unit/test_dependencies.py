@@ -620,6 +620,22 @@ class TestConfigSettingsPipArgs:
             [], ["--config-settings=editable_mode=strict"]
         ) == ["--config-settings", "editable_mode=strict"]
 
+    def test_config_settings_are_removed_from_generic_pip_args(self):
+        from pipenv.routines.install import _split_config_settings_pip_args
+
+        assert _split_config_settings_pip_args(
+            ["editable_mode=strict"],
+            ["--no-build-isolation", "--config-settings=build_number=42"],
+        ) == (
+            [
+                "--config-settings",
+                "editable_mode=strict",
+                "--config-settings",
+                "build_number=42",
+            ],
+            ["--no-build-isolation"],
+        )
+
     def test_package_args_match_normalized_lockfile_name(self):
         from pipenv.routines.install import _pip_args_for_dependency
 
