@@ -129,6 +129,67 @@ def _should_use_no_binary(pkg_name, extra_pip_args):
     return False
 
 
+def _config_settings_pip_args(config_settings, extra_pip_args):
+    """Return normalized pip arguments for package build settings.
+
+    ``--config-settings`` is a per-package build option. Keep it separate
+    from the generic passthrough arguments so it can be recorded in the
+    package's Pipfile entry and replayed on later installs.
+    """
+    pip_args = []
+    for setting in config_settings or ():
+        pip_args.extend(("--config-settings", setting))
+
+    args = list(extra_pip_args or ())
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--config-settings" and index + 1 < len(args):
+            pip_args.extend((arg, args[index + 1]))
+            index += 2
+        elif arg.startswith("--config-settings="):
+            pip_args.extend(("--config-settings", arg.split("=", 1)[1]))
+            index += 1
+        else:
+            index += 1
+    return pip_args
+
+
+def _pip_args_for_dependency(dependency, lockfile_section, pip_line=None):
+    """Read reproducible, package-scoped pip arguments from a lock entry."""
+    dependency_name = getattr(dependency, "name", None)
+
+    def normalize(name):
+        return str(name).lower().replace("-", "_").replace(".", "_")
+
+    for package_name, entry in lockfile_section.items():
+        matches_name = dependency_name and normalize(package_name) == normalize(dependency_name)
+        matches_requirement = False
+        if not matches_name and pip_line and isinstance(entry, dict):
+            from pipenv.utils.dependencies import requirement_from_lockfile
+
+            generated_line = requirement_from_lockfile(
+                package_name,
+                entry,
+                include_hashes=False,
+                include_markers=False,
+            )
+            matches_requirement = generated_line == pip_line
+        if not (matches_name or matches_requirement):
+            continue
+        if not isinstance(entry, dict):
+            return ()
+        pip_args = entry.get("pip_args", ())
+        if isinstance(pip_args, str):
+            return (pip_args,)
+        if isinstance(pip_args, (list, tuple)) and all(
+            isinstance(arg, str) for arg in pip_args
+        ):
+            return tuple(pip_args)
+        return ()
+    return ()
+
+
 def handle_new_packages(
     project,
     ctx: RoutineContext,
@@ -154,6 +215,9 @@ def handle_new_packages(
     editable_packages = list(sel.editable_packages) if sel.editable_packages else []
     pipfile_categories = list(sel.categories) if sel.categories else []
     extra_pip_args = list(exec_opts.extra_pip_args) if exec_opts.extra_pip_args else []
+    package_pip_args = _config_settings_pip_args(
+        getattr(exec_opts, "config_settings", ()), extra_pip_args
+    )
     index = sel.index
 
     new_packages = []
@@ -206,12 +270,17 @@ def handle_new_packages(
                                 sel.dev,
                                 category,
                                 no_binary=no_binary,
+                                pip_args=package_pip_args or None,
                             )
                             if added:
                                 new_packages.append((normalized_name, cat))
                     else:
                         added, cat, normalized_name = project.pipfile.add_package(
-                            pkg_requirement, pkg_line, sel.dev, no_binary=no_binary
+                            pkg_requirement,
+                            pkg_line,
+                            sel.dev,
+                            no_binary=no_binary,
+                            pip_args=package_pip_args or None,
                         )
                         if added:
                             new_packages.append((normalized_name, cat))
@@ -906,37 +975,60 @@ def batch_install(
     )
 
     if search_all_sources:
-        dependencies = [pip_line for _, pip_line in deps_to_install]
-        batch_install_iteration(
-            project,
-            iter_ctx,
-            dependencies,
-            sources,
-            procs,
-            requirements_dir,
-        )
+        deps_by_pip_args = defaultdict(list)
+        for dependency, pip_line in deps_to_install:
+            deps_by_pip_args[
+                _pip_args_for_dependency(dependency, lockfile_section, pip_line)
+            ].append(pip_line)
+        for package_pip_args, dependencies in deps_by_pip_args.items():
+            phase_ctx = replace(
+                iter_ctx,
+                execution_options=replace(
+                    iter_ctx.execution_options,
+                    extra_pip_args=tuple(extra_pip_args) + package_pip_args,
+                ),
+            )
+            batch_install_iteration(
+                project,
+                phase_ctx,
+                dependencies,
+                sources,
+                procs,
+                requirements_dir,
+            )
     else:
         # Sort the dependencies out by index -- include editable/vcs in the default group
-        deps_by_index = defaultdict(list)
+        deps_by_index = defaultdict(lambda: defaultdict(list))
         for dependency, pip_line in deps_to_install:
             index = project.sources.default["name"]
             if dependency.name and dependency.name in lockfile_section:
                 entry = lockfile_section[dependency.name]
                 if isinstance(entry, dict) and "index" in entry:
                     index = entry["index"]
-            deps_by_index[index].append(pip_line)
+            package_pip_args = _pip_args_for_dependency(
+                dependency, lockfile_section, pip_line
+            )
+            deps_by_index[index][package_pip_args].append(pip_line)
         # Treat each index as its own pip install phase
-        for index_name, dependencies in deps_by_index.items():
+        for index_name, dependencies_by_args in deps_by_index.items():
             try:
                 install_source = next(filter(lambda s: s["name"] == index_name, sources))
-                batch_install_iteration(
-                    project,
-                    iter_ctx,
-                    dependencies,
-                    [install_source],
-                    procs,
-                    requirements_dir,
-                )
+                for package_pip_args, dependencies in dependencies_by_args.items():
+                    phase_ctx = replace(
+                        iter_ctx,
+                        execution_options=replace(
+                            iter_ctx.execution_options,
+                            extra_pip_args=tuple(extra_pip_args) + package_pip_args,
+                        ),
+                    )
+                    batch_install_iteration(
+                        project,
+                        phase_ctx,
+                        dependencies,
+                        [install_source],
+                        procs,
+                        requirements_dir,
+                    )
             except StopIteration:  # noqa: PERF203
                 console.print(
                     f"Unable to find {index_name} in sources, please check dependencies: {dependencies}",
